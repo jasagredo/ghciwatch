@@ -3,18 +3,30 @@ use std::pin::Pin;
 use std::process::ExitStatus;
 
 use command_group::AsyncGroupChild;
-use miette::Context;
 use miette::IntoDiagnostic;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use miette::WrapErr;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::sys::signal;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::sys::signal::Signal;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::unistd::Pid;
 use tokio::sync::mpsc;
 use tracing::instrument;
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading;
 
 use crate::shutdown::ShutdownHandle;
 
 pub struct GhciProcess {
     pub shutdown: ShutdownHandle,
+    #[cfg(target_os = "windows")]
+    pub process_group_id: i32,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub process_group_id: Pid,
     /// Notifies this task to _not_ request a shutdown for the entire program when `ghci` exits.
     /// This is used for the graceful shutdown implementation and for routine `ghci` session
@@ -51,16 +63,7 @@ impl GhciProcess {
     ) -> miette::Result<()> {
         // Kill it otherwise.
         tracing::debug!("Killing ghci process tree with SIGKILL");
-        // This is what `self.process.kill()` does, but we can't call that due to borrow
-        // checker shennanigans.
-        signal::killpg(self.process_group_id, Signal::SIGKILL)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to kill ghci process (pid {})",
-                    self.process_group_id
-                )
-            })?;
+        kill(self.process_group_id);
         // Report the exit status.
         let status = wait.await.into_diagnostic()?;
 
@@ -71,4 +74,25 @@ impl GhciProcess {
     async fn exited(&self, status: ExitStatus) {
         tracing::debug!("ghci exited: {status}");
     }
+}
+
+#[cfg(target_os = "windows")]
+fn kill(pid : i32) {
+    unsafe {
+        let prc = Threading::OpenProcess(Threading::PROCESS_ALL_ACCESS, Foundation::TRUE, pid.try_into().unwrap()).unwrap();
+        Threading::TerminateProcess(prc, 0).unwrap();
+    };
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn kill(pid : Pid) {
+    // This is what `self.process.kill()` does, but we can't call that due to borrow
+    // checker shennanigans.
+    signal::killpg(pid, Signal::SIGKILL)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to kill ghci process (pid {})",
+                    pid
+                )
+            }).unwrap();
 }

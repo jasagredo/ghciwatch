@@ -5,7 +5,7 @@ use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use itertools::Itertools;
 use miette::miette;
-use winnow::ascii::newline;
+use winnow::ascii::line_ending;
 use winnow::ascii::space0;
 use winnow::ascii::space1;
 use winnow::combinator::opt;
@@ -117,7 +117,7 @@ pub fn parse_show_paths(input: &str) -> miette::Result<ShowPaths> {
 fn show_paths(input: &mut &str) -> PResult<ShowPaths> {
     let _ = "current working directory:".parse_next(input)?;
     let _ = space0.parse_next(input)?;
-    let _ = newline.parse_next(input)?;
+    let _ = line_ending.parse_next(input)?;
     let _ = space0.parse_next(input)?;
     let cwd = until_newline.map(Utf8PathBuf::from).parse_next(input)?;
     let _ = "module import search paths:".parse_next(input)?;
@@ -132,7 +132,7 @@ fn show_paths(input: &mut &str) -> PResult<ShowPaths> {
         });
     }
 
-    let _ = newline.parse_next(input)?;
+    let _ = line_ending.parse_next(input)?;
     let search_paths = repeat(
         0..,
         preceded(

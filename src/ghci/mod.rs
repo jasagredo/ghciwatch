@@ -1,8 +1,7 @@
 //! The core [`Ghci`] session struct.
 
 use command_group::AsyncCommandGroup;
-use nix::sys::signal;
-use nix::sys::signal::Signal;
+use command_group::AsyncGroupChild;
 use owo_colors::OwoColorize;
 use owo_colors::Stream::Stdout;
 use std::borrow::Borrow;
@@ -24,11 +23,20 @@ use camino::Utf8PathBuf;
 use miette::miette;
 use miette::IntoDiagnostic;
 use miette::WrapErr;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nix::sys::signal;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nix::sys::signal::Signal;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::unistd::Pid;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::sync::mpsc;
 use tracing::instrument;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading;
 
 mod stdin;
 use stdin::GhciStdin;
@@ -192,6 +200,9 @@ pub struct Ghci {
     /// The process group ID of the `ghci` session process.
     ///
     /// This is used to send the process `Ctrl-C` (`SIGINT`) to cancel reloads or other actions.
+    #[cfg(target_os = "windows")]
+    process_group_id: i32,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     process_group_id: Pid,
     /// The stdin writer.
     stdin: GhciStdin,
@@ -261,25 +272,8 @@ impl Ghci {
                 .into_diagnostic()
                 .wrap_err_with(|| format!("Failed to start {}", command.display()))?
         };
-
-        let process_group_id = Pid::from_raw(
-            group
-                .id()
-                .ok_or_else(|| miette!("ghci process has no process group ID"))? as i32,
-        );
-
+        let process_group_id = Self::get_pids(&mut group)?;
         let child = group.inner();
-        let process_id = Pid::from_raw(
-            child
-                .id()
-                .ok_or_else(|| miette!("ghci process has no process ID"))? as i32,
-        );
-        tracing::debug!(
-            pid = process_id.as_raw(),
-            pgid = process_group_id.as_raw(),
-            "Started ghci"
-        );
-
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -343,6 +337,22 @@ impl Ghci {
             },
             command_handles,
         })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn get_pids (group: &mut AsyncGroupChild) -> miette::Result<i32> {
+        let process_group_id = group
+                .id()
+                .ok_or_else(|| miette!("ghci process has no process group ID"))? as i32;
+        return Ok(process_group_id);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn get_pids (group: &mut AsyncGroupChild) -> miette::Result<Pid> {
+        let process_group_id = Pid::from_raw(group
+                .id()
+                .ok_or_else(|| miette!("ghci process has no process group ID"))? as i32
+        );
+        return Ok(process_group_id);
     }
 
     /// Perform post-startup initialization.
@@ -825,9 +835,7 @@ impl Ghci {
     #[instrument(skip_all, level = "debug")]
     async fn send_sigint(&mut self) -> miette::Result<()> {
         let start_instant = Instant::now();
-        signal::killpg(self.process_group_id, Signal::SIGINT)
-            .into_diagnostic()
-            .wrap_err("Failed to send `Ctrl-C` (`SIGINT`) to ghci session")?;
+        Self::kill(self.process_group_id);
         self.stdout
             .prompt(
                 crate::incremental_reader::FindAt::Anywhere,
@@ -837,6 +845,28 @@ impl Ghci {
             .await?;
         tracing::debug!("Interrupted ghci in {:.2?}", start_instant.elapsed());
         Ok(())
+    }
+
+
+    #[cfg(target_os = "windows")]
+    fn kill(pid : i32) {
+        unsafe {
+            let prc = Threading::OpenProcess(Threading::PROCESS_ALL_ACCESS, Foundation::TRUE, pid.try_into().unwrap()).unwrap();
+            Threading::TerminateProcess(prc, 0).unwrap();
+        };
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn kill(pid : Pid) {
+        // This is what `self.process.kill()` does, but we can't call that due to borrow
+        // checker shennanigans.
+        signal::killpg(pid, Signal::SIGKILL)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "Failed to send `Ctrl-C` (`SIGINT`) to ghci session (pid {})",
+                        pid
+                    )
+                }).unwrap();
     }
 
     #[instrument(skip_all, level = "trace")]
